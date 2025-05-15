@@ -9,15 +9,14 @@ load_dotenv()
 
 app = Flask(__name__)
 
-# 🔐 Токени
+# Токени
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ASSISTANT_ID = os.getenv("ASSISTANT_ID")
-
 openai.api_key = OPENAI_API_KEY
 
-# 🧠 Зберігаємо треди користувачів
-user_threads = {}
+# Стани користувачів
+user_states = {}  # {chat_id: {"step": int, "answers": dict}}
 
 @app.route("/")
 def home():
@@ -28,80 +27,52 @@ def webhook():
     data = request.json
     if "message" in data:
         chat_id = data["message"]["chat"]["id"]
-        text = data["message"]["text"]
+        text = data["message"]["text"].strip()
 
-        print(f"[WEBHOOK] Повідомлення від {chat_id}: {text}")
+        # Ініціалізуємо стан, якщо новий користувач
+        if chat_id not in user_states or text == "/start":
+            user_states[chat_id] = {"step": 1, "answers": {}}
+            send_message(chat_id, "*Питання 1/4*\n*У яких регіонах світу ви плануєте подорожувати?*\n(Можна обрати декілька варіантів або вказати конкретну країну/країни.)\n1. Європа\n2. Північна Америка\n3. Азія\n4. Близький Схід\n5. Африка\n6. Південна Америка\n7. Карибський басейн\n8. Океанія\n9. Мене цікавлять лише деякі країни (вкажіть які)", markdown=True)
+            return {"ok": True}
 
-        # Відповідаємо одразу, поки GPT думає
-        send_message(chat_id, "✍️ Думаю над відповіддю...")
+        step = user_states[chat_id]["step"]
 
-        try:
-            # Отримуємо або створюємо thread
-            thread_id = get_or_create_thread(chat_id)
-            print(f"[THREAD] Користувач {chat_id} -> thread {thread_id}")
+        if step == 1:
+            user_states[chat_id]["answers"]["regions"] = text
+            user_states[chat_id]["step"] = 2
+            send_message(chat_id, "*Питання 2/4*\n*Яку категорію готелів ви зазвичай обираєте?*\n1. Luxury (преміум-клас)\n2. Comfort (середній клас)\n3. Essential (економ-клас)", markdown=True)
+        
+        elif step == 2:
+            if text.lower() not in ["luxury", "comfort", "essential"]:
+                send_message(chat_id, "❗️ Будь ласка, оберіть лише один із запропонованих варіантів: Luxury, Comfort або Essential.")
+                return {"ok": True}
+            user_states[chat_id]["answers"]["category"] = text
+            user_states[chat_id]["step"] = 3
+            send_message(chat_id, "*Питання 3/4*\n*Який стиль готелю ви зазвичай обираєте?* (Оберіть до трьох варіантів.)\n1. Розкішний і вишуканий\n2. Бутік і унікальний\n3. Класичний і традиційний\n4. Сучасний і дизайнерський\n5. Затишний і сімейний\n6. Практичний і економічний", markdown=True)
 
-            # Додаємо повідомлення
-            openai.beta.threads.messages.create(
-                thread_id=thread_id,
-                role="user",
-                content=text
-            )
-            print("[OPENAI] Повідомлення передано")
+        elif step == 3:
+            user_states[chat_id]["answers"]["style"] = text
+            user_states[chat_id]["step"] = 4
+            send_message(chat_id, "*Питання 4/4*\n*З якою метою ви зазвичай зупиняєтеся в готелі?* (Оберіть до двох варіантів.)\n1. Бізнес-подорожі / відрядження\n2. Відпустка / релакс\n3. Сімейний відпочинок\n4. Довготривале проживання", markdown=True)
 
-            # Запускаємо асистента
-            run = openai.beta.threads.runs.create(
-                thread_id=thread_id,
-                assistant_id=ASSISTANT_ID
-            )
-            print("[OPENAI] Асистент запущений")
+        elif step == 4:
+            user_states[chat_id]["answers"]["purpose"] = text
+            send_message(chat_id, "✅ Дякую! Я опрацюю вашу інформацію й надам рекомендації.")
+            # Тут ти можеш вставити обрахунок OpenAI або відповіді
+            user_states[chat_id]["step"] = 5  # фінальний
+        else:
+            send_message(chat_id, "Ви вже завершили анкету. Надішліть /start, щоб пройти знову.")
 
-            # Чекаємо на завершення
-            while True:
-                status = openai.beta.threads.runs.retrieve(
-                    thread_id=thread_id,
-                    run_id=run.id
-                )
-                print(f"[RUN STATUS] {status.status}")
-                if status.status == "completed":
-                    break
-                elif status.status in ["failed", "cancelled", "expired"]:
-                    send_message(chat_id, "⚠️ Виникла помилка. Спробуйте ще раз.")
-                    return {"ok": True}
-                time.sleep(1)
-
-            # Отримуємо відповідь
-            messages = openai.beta.threads.messages.list(thread_id=thread_id)
-            reply = next((msg.content[0].text.value for msg in reversed(messages.data) if msg.role == "assistant"), None)
-
-            if reply:
-                send_message(chat_id, reply)
-                print(f"[REPLY] {reply}")
-            else:
-                send_message(chat_id, "🤖 Не вдалося сформувати відповідь.")
-                print("[REPLY] Відповідь порожня")
-
-        except Exception as e:
-            print(f"[ERROR] {e}")
-            send_message(chat_id, "⚠️ Сталася технічна помилка. GPT не відповів.")
-    
     return {"ok": True}
 
-
-def send_message(chat_id, text):
+def send_message(chat_id, text, markdown=False):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": chat_id,
-        "text": text
+        "text": text,
+        "parse_mode": "Markdown" if markdown else None
     }
     requests.post(url, json=payload)
-    print(f"[BOT] Відповідь: {text}")
-
-
-def get_or_create_thread(user_id):
-    if user_id not in user_threads:
-        thread = openai.beta.threads.create()
-        user_threads[user_id] = thread.id
-    return user_threads[user_id]
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
